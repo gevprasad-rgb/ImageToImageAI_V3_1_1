@@ -1,0 +1,195 @@
+name: Build Android APK (archive-backed, verified)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image2imageai-archive-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python 3.13.16
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13.16"
+
+      - name: Locate exactly one source archive
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t zips < <(find . -maxdepth 1 -type f -name 'ImageToImageAI_V3_1_1_APK_BUILD_READY.zip' -print | sort)
+          test "${#zips[@]}" -eq 1
+          archive="${zips[0]#./}"
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+          sha256sum "$archive" | tee "$RUNNER_TEMP/archive.sha256"
+          unzip -t "$archive" >/dev/null
+
+      - name: Validate and extract exact source tree
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.locate.outputs.archive }}
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/image2imageai-source"
+          mkdir -p "$RUNNER_TEMP/image2imageai-source"
+          python - "$ARCHIVE" "$RUNNER_TEMP/image2imageai-source" <<'PY'
+          from pathlib import Path
+          import sys
+          import zipfile
+          archive = Path(sys.argv[1])
+          out = Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive) as zf:
+              names = zf.namelist()
+              if not names:
+                  raise SystemExit("archive is empty")
+              for name in names:
+                  p = Path(name)
+                  if p.is_absolute() or ".." in p.parts:
+                      raise SystemExit(f"unsafe archive path: {name}")
+              zf.extractall(out)
+          required = [
+              'gradlew', 'gradle/wrapper/gradle-wrapper.properties',
+              'gradle/wrapper/gradle-wrapper.jar.sha256',
+              'settings.gradle', 'build.gradle', 'app/build.gradle',
+              'app/src/main/AndroidManifest.xml',
+              'backend/server.py', 'backend/requirements.txt',
+              'SOURCE_SHA256SUMS.txt'
+          ]
+          missing = [x for x in required if not (out / x).is_file()]
+          if missing:
+              raise SystemExit('missing required source files: ' + ', '.join(missing))
+          roots = {Path(x).parts[0] for x in names if x}
+          forbidden_roots = {'.git', 'build', '.gradle'}
+          bad = sorted(roots & forbidden_roots)
+          if bad:
+              raise SystemExit('stale/build roots present in archive: ' + ', '.join(bad))
+          print(out)
+          PY
+          SRC="$RUNNER_TEMP/image2imageai-source"
+          test -f "$SRC/SOURCE_SHA256SUMS.txt"
+          (cd "$SRC" && sha256sum -c SOURCE_SHA256SUMS.txt)
+          chmod +x "$SRC/gradlew" "$SRC/backend/run_backend.sh"
+          rm -rf "$SRC/backend/__pycache__" "$SRC/backend/tests/__pycache__" "$SRC/app/build" "$SRC/.gradle"
+
+      - name: Run backend contract tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/image2imageai-source"
+          python -m pip install --disable-pip-version-check -r "$SRC/backend/requirements.txt"
+          (cd "$SRC" && python -m compileall -q backend && python -m unittest discover -s backend/tests -v)
+
+      - name: Verify Android SDK 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          sdkmanager=""
+          for candidate in \
+            "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "$SDK_ROOT/cmdline-tools/bin/sdkmanager"; do
+            if [ -x "$candidate" ]; then sdkmanager="$candidate"; break; fi
+          done
+          if [ -z "$sdkmanager" ]; then
+            sdkmanager="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' -print -quit 2>/dev/null || true)"
+          fi
+          test -x "$sdkmanager"
+          set +o pipefail
+          yes | "$sdkmanager" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1
+          rc=${PIPESTATUS[1]}
+          set -o pipefail
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 141 ]
+          "$sdkmanager" --sdk_root="$SDK_ROOT" platform-tools 'platforms;android-36' 'build-tools;36.0.0'
+          test -x "$SDK_ROOT/platform-tools/adb"
+          test -x "$SDK_ROOT/build-tools/36.0.0/aapt"
+          test -x "$SDK_ROOT/build-tools/36.0.0/apksigner"
+          test -x "$SDK_ROOT/build-tools/36.0.0/zipalign"
+
+      - name: Bootstrap and verify Gradle Wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/image2imageai-source"
+          EXPECTED='55243ef57851f12b070ad14f7f5bb8302daceeebc5bce5ece5fa6edb23e1145c'
+          JAR="$SRC/gradle/wrapper/gradle-wrapper.jar"
+          if [ ! -s "$JAR" ]; then
+            curl --fail --location --silent --show-error \
+              https://raw.githubusercontent.com/gradle/gradle/v9.4.1/gradle/wrapper/gradle-wrapper.jar \
+              -o "$JAR"
+          fi
+          actual="$(sha256sum "$JAR" | awk '{print $1}')"
+          test "$actual" = "$EXPECTED"
+          chmod +x "$SRC/gradlew"
+          (cd "$SRC" && ./gradlew --version --no-daemon --stacktrace --console=plain)
+
+      - name: Lint, unit tests and assemble debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/image2imageai-source"
+          rm -rf "$SRC/app/build" "$SRC/.gradle"
+          (cd "$SRC" && ./gradlew --no-daemon --stacktrace --warning-mode all --console=plain :app:lintDebug :app:testDebugUnitTest :app:assembleDebug)
+
+      - name: Inspect APK and record provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/image2imageai-source"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          APK="$SRC/app/build/outputs/apk/debug/app-debug.apk"
+          AAPT="$SDK_ROOT/build-tools/36.0.0/aapt"
+          APKSIGNER="$SDK_ROOT/build-tools/36.0.0/apksigner"
+          ZIPALIGN="$SDK_ROOT/build-tools/36.0.0/zipalign"
+          test -s "$APK"
+          test "$(wc -c < "$APK")" -gt 10000
+          "$ZIPALIGN" -c -P 16 -v 4 "$APK"
+          "$APKSIGNER" verify --verbose "$APK"
+          "$AAPT" dump badging "$APK" | tee "$RUNNER_TEMP/apk-badging.txt"
+          grep -Fq "package: name='com.prasad.image2image'" "$RUNNER_TEMP/apk-badging.txt"
+          grep -Fq "versionCode='32'" "$RUNNER_TEMP/apk-badging.txt"
+          grep -Fq "versionName='3.1.1'" "$RUNNER_TEMP/apk-badging.txt"
+          sha256sum "$APK" | tee "$RUNNER_TEMP/apk.sha256"
+          {
+            echo "archive_sha256=$(cut -d' ' -f1 "$RUNNER_TEMP/archive.sha256")"
+            echo "apk_sha256=$(cut -d' ' -f1 "$RUNNER_TEMP/apk.sha256")"
+            echo "apk_bytes=$(wc -c < "$APK")"
+            echo "package=com.prasad.image2image"
+            echo "versionCode=32"
+            echo "versionName=3.1.1"
+            echo "variant=debug"
+            echo "runtime_smoke=NOT_PERFORMED"
+            echo "live_provider=NOT_PERFORMED"
+          } > "$RUNNER_TEMP/provenance.txt"
+
+      - name: Upload APK and verification evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ImageToImageAI-v3.1.1-debug-apk-verified
+          path: |
+            ${{ runner.temp }}/image2imageai-source/app/build/outputs/apk/debug/app-debug.apk
+            ${{ runner.temp }}/apk-badging.txt
+            ${{ runner.temp }}/apk.sha256
+            ${{ runner.temp }}/archive.sha256
+            ${{ runner.temp }}/provenance.txt
+          if-no-files-found: error
+          retention-days: 14
