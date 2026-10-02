@@ -1,7 +1,10 @@
 name: Build Android APK (archive-backed, verified)
 
-on:
+"on":
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
