@@ -99,7 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           SRC="$RUNNER_TEMP/image2imageai-source"
-          python -m pip install --disable-pip-version-check -r "$SRC/backend/requirements.txt"
+          python -m pip install --disable-pip-version-check -r "$SRC/backend/requirements.txt" httpx2==2.13.1
           (cd "$SRC" && python -m compileall -q backend && python -m unittest discover -s backend/tests -v)
 
       - name: Verify Android SDK 36
